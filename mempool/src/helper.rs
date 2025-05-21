@@ -10,15 +10,15 @@ use tokio::sync::mpsc::Receiver;
 #[path = "tests/helper_tests.rs"]
 pub mod helper_tests;
 
-/// A task dedicated to help other authorities by replying to their batch requests.
+/// A task dedicated to help other authorities by replying to their transaction requests.
 pub struct Helper {
     /// The committee information.
     committee: Committee,
     /// The persistent storage.
     store: Store,
-    /// Input channel to receive batch requests.
+    /// Input channel to receive transaction requests.
     rx_request: Receiver<(Vec<Digest>, PublicKey)>,
-    /// A network sender to send the batches to the other mempools.
+    /// A network sender to send the transactions to the other mempools.
     network: SimpleSender,
 }
 
@@ -56,7 +56,9 @@ impl Helper {
             // Reply to the request (the best we can).
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
-                    Ok(Some(data)) => self.network.send(address, Bytes::from(data)).await,
+                    Ok(Some(data)) => {
+                        self.network.send(address, Bytes::from(data)).await;
+                    },
                     Ok(None) => (),
                     Err(e) => error!("{}", e),
                 }

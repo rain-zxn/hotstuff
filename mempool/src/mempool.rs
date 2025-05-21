@@ -1,4 +1,4 @@
-use crate::batch_maker::{Batch, BatchMaker, Transaction};
+use crate::batch_maker::{Transaction, TransactionProcessor};
 use crate::config::{Committee, Parameters};
 use crate::helper::Helper;
 use crate::processor::{Processor, SerializedBatchMessage};
@@ -28,8 +28,8 @@ pub type Round = u64;
 /// The message exchanged between the nodes' mempool.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MempoolMessage {
-    Batch(Batch),
-    BatchRequest(Vec<Digest>, /* origin */ PublicKey),
+    Transaction(Transaction),
+    TransactionRequest(Vec<Digest>, /* origin */ PublicKey),
 }
 
 /// The messages sent by the consensus and the mempool.
@@ -107,9 +107,7 @@ impl Mempool {
 
     /// Spawn all tasks responsible to handle clients transactions.
     fn handle_clients_transactions(&self) {
-        let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
-        let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
-        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
+        let (tx_transaction, rx_transaction) = channel(CHANNEL_CAPACITY);
 
         // We first receive clients' transactions from the network.
         let mut address = self
@@ -119,35 +117,17 @@ impl Mempool {
         address.set_ip("0.0.0.0".parse().unwrap());
         NetworkReceiver::spawn(
             address,
-            /* handler */ TxReceiverHandler { tx_batch_maker },
+            /* handler */
+            TxReceiverHandler {
+                tx_transaction,
+            },
         );
 
-        // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
-        // (in a reliable manner) the batches to all other mempools that share the same `id` as us. Finally,
-        // it gathers the 'cancel handlers' of the messages and send them to the `QuorumWaiter`.
-        BatchMaker::spawn(
-            self.parameters.batch_size,
-            self.parameters.max_batch_delay,
-            /* rx_transaction */ rx_batch_maker,
-            /* tx_message */ tx_quorum_waiter,
+        TransactionProcessor::spawn(
+            /* rx_transaction */ rx_transaction,
+            /* tx_message */ self.tx_consensus.clone(),
             /* mempool_addresses */
             self.committee.broadcast_addresses(&self.name),
-        );
-
-        // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
-        // the batch to the `Processor`.
-        QuorumWaiter::spawn(
-            self.committee.clone(),
-            /* stake */ self.committee.stake(&self.name),
-            /* rx_message */ rx_quorum_waiter,
-            /* tx_batch */ tx_processor,
-        );
-
-        // The `Processor` hashes and stores the batch. It then forwards the batch's digest to the consensus.
-        Processor::spawn(
-            self.store.clone(),
-            /* rx_batch */ rx_processor,
-            /* tx_digest */ self.tx_consensus.clone(),
         );
 
         info!("Mempool listening to client transactions on {}", address);
@@ -156,7 +136,7 @@ impl Mempool {
     /// Spawn all tasks responsible to handle messages from other mempools.
     fn handle_mempool_messages(&self) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
-        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
+        let (tx_consensus, rx_consensus) = channel(CHANNEL_CAPACITY);
 
         // Receive incoming messages from other mempools.
         let mut address = self
@@ -169,7 +149,7 @@ impl Mempool {
             /* handler */
             MempoolReceiverHandler {
                 tx_helper,
-                tx_processor,
+                tx_consensus,
             },
         );
 
@@ -180,13 +160,13 @@ impl Mempool {
             /* rx_request */ rx_helper,
         );
 
-        // This `Processor` hashes and stores the batches we receive from the other mempools. It then forwards the
-        // batch's digest to the consensus.
-        Processor::spawn(
-            self.store.clone(),
-            /* rx_batch */ rx_processor,
-            /* tx_digest */ self.tx_consensus.clone(),
-        );
+        // Forward received transaction digests directly to consensus
+        tokio::spawn(async move {
+            while let Some(digest) = rx_consensus.recv().await {
+                self.tx_consensus.send(digest).await
+                    .expect("Failed to send transaction digest to consensus");
+            }
+        });
 
         info!("Mempool listening to mempool messages on {}", address);
     }
@@ -195,14 +175,14 @@ impl Mempool {
 /// Defines how the network receiver handles incoming transactions.
 #[derive(Clone)]
 struct TxReceiverHandler {
-    tx_batch_maker: Sender<Transaction>,
+    tx_transaction: Sender<Transaction>,
 }
 
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
-        // Send the transaction to the batch maker.
-        self.tx_batch_maker
+        // Send the transaction directly for processing
+        self.tx_transaction
             .send(message.to_vec())
             .await
             .expect("Failed to send transaction");
@@ -217,7 +197,7 @@ impl MessageHandler for TxReceiverHandler {
 #[derive(Clone)]
 struct MempoolReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
-    tx_processor: Sender<SerializedBatchMessage>,
+    tx_consensus: Sender<Digest>,
 }
 
 #[async_trait]
@@ -228,16 +208,21 @@ impl MessageHandler for MempoolReceiverHandler {
 
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
-            Ok(MempoolMessage::Batch(..)) => self
-                .tx_processor
-                .send(serialized.to_vec())
-                .await
-                .expect("Failed to send batch"),
-            Ok(MempoolMessage::BatchRequest(missing, requestor)) => self
+            Ok(MempoolMessage::Transaction(transaction)) => {
+                // Create a digest from the transaction
+                let digest = Digest::new(&transaction);
+                
+                // Send the transaction digest directly to consensus
+                self.tx_consensus
+                    .send(digest)
+                    .await
+                    .expect("Failed to send transaction digest");
+            },
+            Ok(MempoolMessage::TransactionRequest(missing, requestor)) => self
                 .tx_helper
                 .send((missing, requestor))
                 .await
-                .expect("Failed to send batch request"),
+                .expect("Failed to send transaction request"),
             Err(e) => warn!("Serialization error: {}", e),
         }
         Ok(())

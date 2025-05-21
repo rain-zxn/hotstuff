@@ -1,11 +1,6 @@
 use crate::mempool::MempoolMessage;
-use crate::quorum_waiter::QuorumWaiterMessage;
 use bytes::Bytes;
-#[cfg(feature = "benchmark")]
-use crypto::Digest;
-use crypto::PublicKey;
-#[cfg(feature = "benchmark")]
-use ed25519_dalek::{Digest as _, Sha512};
+use crypto::{Digest, PublicKey};
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::ReliableSender;
@@ -13,52 +8,35 @@ use network::ReliableSender;
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::Instant;
 
 #[cfg(test)]
 #[path = "tests/batch_maker_tests.rs"]
 pub mod batch_maker_tests;
 
 pub type Transaction = Vec<u8>;
-pub type Batch = Vec<Transaction>;
 
-/// Assemble clients transactions into batches.
-pub struct BatchMaker {
-    /// The preferred batch size (in bytes).
-    batch_size: usize,
-    /// The maximum delay after which to seal the batch (in ms).
-    max_batch_delay: u64,
+pub struct TransactionProcessor {
     /// Channel to receive transactions from the network.
     rx_transaction: Receiver<Transaction>,
-    /// Output channel to deliver sealed batches to the `QuorumWaiter`.
-    tx_message: Sender<QuorumWaiterMessage>,
+    tx_consensus: Sender<Digest>,
     /// The network addresses of the other mempools.
     mempool_addresses: Vec<(PublicKey, SocketAddr)>,
-    /// Holds the current batch.
-    current_batch: Batch,
-    /// Holds the size of the current batch (in bytes).
-    current_batch_size: usize,
     /// A network sender to broadcast the batches to the other mempools.
     network: ReliableSender,
 }
 
-impl BatchMaker {
+impl TransactionProcessor {
     pub fn spawn(
-        batch_size: usize,
-        max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>,
-        tx_message: Sender<QuorumWaiterMessage>,
+        tx_consensus: Sender<Digest>,
         mempool_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
         tokio::spawn(async move {
             Self {
-                batch_size,
-                max_batch_delay,
                 rx_transaction,
-                tx_message,
+                tx_consensus,
                 mempool_addresses,
-                current_batch: Batch::with_capacity(batch_size * 2),
-                current_batch_size: 0,
                 network: ReliableSender::new(),
             }
             .run()
@@ -68,27 +46,11 @@ impl BatchMaker {
 
     /// Main loop receiving incoming transactions and creating batches.
     async fn run(&mut self) {
-        let timer = sleep(Duration::from_millis(self.max_batch_delay));
-        tokio::pin!(timer);
-
         loop {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
-                    self.current_batch_size += transaction.len();
-                    self.current_batch.push(transaction);
-                    if self.current_batch_size >= self.batch_size {
-                        self.seal().await;
-                        timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
-                    }
-                },
-
-                // If the timer triggers, seal the batch even if it contains few transactions.
-                () = &mut timer => {
-                    if !self.current_batch.is_empty() {
-                        self.seal().await;
-                    }
-                    timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
+                    self.process_transaction(transaction).await;
                 }
             }
 
@@ -97,60 +59,40 @@ impl BatchMaker {
         }
     }
 
-    /// Seal and broadcast the current batch.
-    async fn seal(&mut self) {
-        #[cfg(feature = "benchmark")]
-        let size = self.current_batch_size;
-
-        // Look for sample txs (they all start with 0) and gather their txs id (the next 8 bytes).
-        #[cfg(feature = "benchmark")]
-        let tx_ids: Vec<_> = self
-            .current_batch
-            .iter()
-            .filter(|tx| tx[0] == 0u8 && tx.len() > 8)
-            .filter_map(|tx| tx[1..9].try_into().ok())
-            .collect();
-
-        // Serialize the batch.
-        self.current_batch_size = 0;
-        let batch: Vec<_> = self.current_batch.drain(..).collect();
-        let message = MempoolMessage::Batch(batch);
-        let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
-
+    /// Seal and broadcast the current transaction
+    async fn process_transaction(&mut self, transaction: Transaction) {
+        let digest = Digest::new(&transaction);
+        
         #[cfg(feature = "benchmark")]
         {
-            // NOTE: This is one extra hash that is only needed to print the following log entries.
-            let digest = Digest(
-                Sha512::digest(&serialized).as_slice()[..32]
-                    .try_into()
-                    .unwrap(),
-            );
-
-            for id in tx_ids {
-                // NOTE: This log entry is used to compute performance.
-                info!(
-                    "Batch {:?} contains sample tx {}",
-                    digest,
-                    u64::from_be_bytes(id)
-                );
+            if transaction.len() > 8 && transaction[0] == 0u8 {
+                if let Ok(id) = transaction[1..9].try_into() {
+                    // NOTE: This log entry is used to compute performance.
+                    info!(
+                        "Transaction {:?} is sample tx {}",
+                        digest,
+                        u64::from_be_bytes(id)
+                    );
+                }
             }
-
+            
             // NOTE: This log entry is used to compute performance.
-            info!("Batch {:?} contains {} B", digest, size);
+            info!("Transaction {:?} contains {} B", digest, transaction.len());
         }
-
-        // Broadcast the batch through the network.
-        let (names, addresses): (Vec<_>, _) = self.mempool_addresses.iter().cloned().unzip();
-        let bytes = Bytes::from(serialized.clone());
-        let handlers = self.network.broadcast(addresses, bytes).await;
-
-        // Send the batch through the deliver channel for further processing.
-        self.tx_message
-            .send(QuorumWaiterMessage {
-                batch: serialized,
-                handlers: names.into_iter().zip(handlers.into_iter()).collect(),
-            })
+        
+        // Broadcast the transaction through the network.
+        let message = MempoolMessage::Transaction(transaction);
+        let serialized = bincode::serialize(&message).expect("Failed to serialize transaction");
+        
+        // Broadcast the transaction through the network
+        let (_, addresses): (Vec<_>, _) = self.mempool_addresses.iter().cloned().unzip();
+        let bytes = Bytes::from(serialized);
+        let _ = self.network.broadcast(addresses, bytes).await;
+        
+        // Send the transaction through the deliver channel for further processing.
+        self.tx_consensus
+            .send(digest)
             .await
-            .expect("Failed to deliver batch");
+            .expect("Failed to deliver transaction digest");
     }
 }
