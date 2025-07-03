@@ -94,15 +94,18 @@ class LocalBench:
             # Run the nodes.
             dbs = [PathMaker.db_path(i) for i in range(nodes)]
             node_logs = [PathMaker.node_log_file(i) for i in range(nodes)]
-            for key_file, db, log_file in zip(key_files, dbs, node_logs):
+            rpc_ports = [8080 + i for i in range(nodes)]
+            for i, (key_file, db, log_file, rpc_port) in enumerate(zip(key_files, dbs, node_logs, rpc_ports)):
                 cmd = CommandMaker.run_node(
                     key_file,
                     PathMaker.committee_file(),
                     db,
                     PathMaker.parameters_file(),
+                    rpc_port=rpc_port,
                     debug=debug
                 )
                 self._background_run(cmd, log_file)
+                Print.info(f'Node {i} started with RPC port {rpc_port}')
 
             # Wait for the nodes to synchronize
             Print.info('Waiting for the nodes to synchronize...')

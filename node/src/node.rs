@@ -12,6 +12,7 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 
 pub struct Node {
     pub commit: Receiver<Block>,
+    pub store: Store,
 }
 
 impl Node {
@@ -71,7 +72,7 @@ impl Node {
         );
 
         info!("Node {} successfully booted", name_encoded);
-        Ok(Self { commit: rx_commit })
+        Ok(Self { commit: rx_commit, store: store.clone() })
     }
 
     pub fn print_key_file(filename: &str) -> Result<(), ConfigError> {

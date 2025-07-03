@@ -1,5 +1,6 @@
 mod config;
 mod node;
+mod rpc;
 
 use crate::node::Node;
 use clap::{Parser, Subcommand};
@@ -46,6 +47,9 @@ enum Command {
         /// The path where to create the data store.
         #[clap(short, long, value_parser, value_name = "PATH")]
         store: String,
+        /// The RPC server port.
+        #[clap(long, value_parser, value_name = "PORT", default_value = "8080")]
+        rpc_port: u16,
     },
     /// Deploy a local testbed with the specified number of nodes.
     Deploy {
@@ -81,8 +85,14 @@ async fn main() {
             committee,
             parameters,
             store,
+            rpc_port,
         } => match Node::new(&committee, &keys, &store, parameters).await {
             Ok(mut node) => {
+                let rpc_service = crate::rpc::RpcService::new(node.store.clone());
+                tokio::spawn(async move {
+                    rpc_service.start(rpc_port).await;
+                });
+                
                 tokio::spawn(async move {
                     node.analyze_block().await;
                 })

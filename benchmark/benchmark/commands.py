@@ -25,14 +25,16 @@ class CommandMaker:
         return f'./node keys --filename {filename}'
 
     @staticmethod
-    def run_node(keys, committee, store, parameters, debug=False):
+    def run_node(keys, committee, store, parameters, rpc_port=None, debug=False):
         assert isinstance(keys, str)
         assert isinstance(committee, str)
         assert isinstance(parameters, str)
         assert isinstance(debug, bool)
+        assert rpc_port is None or isinstance(rpc_port, int)
         v = '-vvv' if debug else '-vv'
+        rpc_param = f'--rpc-port {rpc_port}' if rpc_port else ''
         return (f'./node {v} run --keys {keys} --committee {committee} '
-                f'--store {store} --parameters {parameters}')
+                f'--store {store} --parameters {parameters} {rpc_param}').strip()
 
     @staticmethod
     def run_client(address, size, rate, timeout, nodes=[]):

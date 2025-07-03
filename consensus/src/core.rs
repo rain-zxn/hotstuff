@@ -147,6 +147,11 @@ impl Core {
             let parent = self.synchronizer.get_parent_block(&block).await?.expect("Parent block should exist");
             let sync_block = block.aggregated_block(parent, &self.committee);
             debug!("Aggregated {:?}", sync_block);
+            
+            let prev_key = bincode::serialize(&sync_block.prev).expect("Failed to serialize prev");
+            let proof_value = bincode::serialize(&sync_block.proof).expect("Failed to serialize proof");
+            self.store.clone().write(prev_key, proof_value).await;
+            
             if let Err(e) = self.tx_commit.send(block).await {
                 warn!("Failed to send block through the commit channel: {}", e);
             }

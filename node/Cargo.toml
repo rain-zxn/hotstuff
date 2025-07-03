@@ -21,6 +21,8 @@ rand = "0.7.3"
 thiserror = "1.0.21"
 anyhow = "1.0.38"
 base64 = "0.21"
+warp = "0.3"
+hex = "0.4"
 
 crypto = { path = "../crypto" }
 circuit = { path = "../circuit" }
